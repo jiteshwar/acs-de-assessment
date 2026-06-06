@@ -1,0 +1,136 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: S3 -> EventBridge -> Lambda -> Glue ETL Pipeline
+
+Resources:
+
+  SourceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+
+  TargetBucket:
+    Type: AWS::S3::Bucket
+
+  GlueJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - glue.amazonaws.com
+            Action:
+              - sts:AssumeRole
+
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+
+      Policies:
+        - PolicyName: GlueS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt SourceBucket.Arn
+                  - !Sub "${SourceBucket.Arn}/*"
+
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource:
+                  - !Sub "${TargetBucket.Arn}/*"
+
+  GlueJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub glue-etl-job-${AWS::StackName}
+      Role: !GetAtt GlueJobRole.Arn
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub s3://${SourceBucket}/scripts/glue-etl-script.py
+        PythonVersion: "3"
+      GlueVersion: "4.0"
+      NumberOfWorkers: 2
+      WorkerType: G.1X
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+      Policies:
+        - PolicyName: StartGlueJob
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                Resource:
+                  - !Sub arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:job/${GlueJob}
+
+  TriggerGlueLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Timeout: 60
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+
+          glue = boto3.client('glue')
+
+          def lambda_handler(event, context):
+              glue.start_job_run(
+                  JobName="${JOB_NAME}"
+              )
+              return {"status": "started"}
+
+      Environment:
+        Variables:
+          JOB_NAME: !Ref GlueJob
+
+  EventBridgeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - Object Created
+        detail:
+          bucket:
+            name:
+              - !Ref SourceBucket
+      Targets:
+        - Arn: !GetAtt TriggerGlueLambda.Arn
+          Id: TriggerGlueLambda
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref TriggerGlueLambda
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt EventBridgeRule.Arn
