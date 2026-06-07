@@ -98,7 +98,7 @@ Resources:
         Streams an Adobe Analytics TSV from S3, applies last-touch search
         attribution, and writes a revenue-sorted .tab report to S3.
       Runtime: python3.12
-      Handler: lambda_search_keyword_performance.lambda_handler
+      Handler: index.lambda_handler
       MemorySize: !Ref LambdaMemoryMB
       Timeout: !Ref LambdaTimeoutSeconds
       Role: !GetAtt LambdaExecutionRole.Arn
