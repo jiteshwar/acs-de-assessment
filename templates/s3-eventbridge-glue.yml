@@ -55,7 +55,7 @@ Resources:
       Role: !GetAtt GlueJobRole.Arn
       Command:
         Name: glueetl
-        ScriptLocation: !Sub s3://${SourceBucket}/scripts/glue-etl-script.py
+        ScriptLocation: !Sub s3://jitesh-acs-assessment-script/glue_search_keyword_performance.py
         PythonVersion: "3"
       GlueVersion: "4.0"
       NumberOfWorkers: 2
