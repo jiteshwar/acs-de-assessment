@@ -99,8 +99,8 @@ Resources:
                 Resource:
                   - !GetAtt SourceBucket.Arn
                   - !Sub ${SourceBucket.Arn}/*
-                  - !GetAtt arn:aws:s3:::jitesh-acs-assessment-script
-                  - !Sub arn:aws:s3:::jitesh-acs-assessment-script/*
+                  - arn:aws:s3:::jitesh-acs-assessment-script
+                  - arn:aws:s3:::jitesh-acs-assessment-script/*
                   
               # Write keyword-performance output to TargetBucket
               - Effect: Allow
