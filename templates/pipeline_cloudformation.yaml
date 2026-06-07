@@ -1,0 +1,326 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Adobe ACS — Search Keyword Performance Pipeline
+  S3 (TSV upload) → EventBridge → Lambda → Glue ETL → S3 (output .tab)
+
+  How it works:
+    1. A TSV hit-level file is uploaded to SourceBucket under the input/ prefix.
+    2. EventBridge fires an "Object Created" event scoped to that prefix.
+    3. Lambda receives the event, extracts the exact S3 path, and starts the
+       Glue job passing that path as --INPUT_S3_PATH.
+    4. Glue reads the file, runs the search-keyword attribution pipeline, and
+       writes YYYY-mm-dd_SearchKeywordPerformance.tab to TargetBucket/output/.
+
+Parameters:
+  GlueScriptKey:
+    Type: String
+    Default: scripts/glue_search_keyword_performance.py
+    Description: >
+      S3 key (path inside SourceBucket) where the Glue script was uploaded.
+      Upload the script before running the stack or the first job run will fail.
+
+  GlueWorkerType:
+    Type: String
+    Default: G.1X
+    AllowedValues: [G.1X, G.2X, G.4X]
+    Description: >
+      G.1X  — 4 vCPU / 16 GB  (files up to ~20 GB)
+      G.2X  — 8 vCPU / 32 GB  (files up to ~50 GB)
+      G.4X  — 16 vCPU / 64 GB (50 GB+)
+
+  NumberOfWorkers:
+    Type: Number
+    Default: 5
+    MinValue: 2
+    Description: Number of Glue DPU workers. Scale up for larger input files.
+
+  InputPrefix:
+    Type: String
+    Default: input/
+    Description: >
+      S3 key prefix that triggers the pipeline. Only objects uploaded under
+      this prefix will start the Glue job (prevents script uploads from
+      triggering a run).
+
+  OutputPrefix:
+    Type: String
+    Default: output/
+    Description: S3 key prefix in TargetBucket where results are written.
+
+# ── Resources ────────────────────────────────────────────────────────────────
+Resources:
+
+  # ── S3 Buckets ─────────────────────────────────────────────────────────────
+
+  SourceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      # EventBridge integration — all object events are published automatically
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+          
+  ScriptBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      # EventBridge integration — all object events are published automatically
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+
+  TargetBucket:
+    Type: AWS::S3::Bucket
+
+  # ── Glue IAM Role ───────────────────────────────────────────────────────────
+
+  GlueJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-glue-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: GlueS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Read TSV data and the Glue script from SourceBucket
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt SourceBucket.Arn
+                  - !Sub ${SourceBucket.Arn}/*
+                  - !GetAtt ScriptBucket.Arn
+                  - !Sub ${ScriptBucket.Arn}/*
+              # Write keyword-performance output to TargetBucket
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject   # needed by Spark when overwriting output
+                Resource:
+                  - !Sub ${TargetBucket.Arn}/*
+              # Allow Glue to write Spark event logs back to SourceBucket
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource:
+                  - !Sub ${SourceBucket.Arn}/spark-logs/*
+
+  # ── Glue Job ────────────────────────────────────────────────────────────────
+
+  GlueJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub ${AWS::StackName}-search-keyword-performance
+      Description: >
+        Reads Adobe Analytics hit-level TSV, applies last-touch search
+        attribution, and writes a revenue-ranked tab-delimited keyword report.
+      Role: !GetAtt GlueJobRole.Arn
+      Command:
+        Name: glueetl
+        # Script lives in SourceBucket — upload it before running the stack
+        ScriptLocation: !Sub s3://jitesh-acs-assessment-script/glue_search_keyword_performance.py
+        PythonVersion: "3"
+      GlueVersion: "4.0"
+      WorkerType: !Ref GlueWorkerType
+      NumberOfWorkers: !Ref NumberOfWorkers
+      Timeout: 60          # minutes — increase for very large files
+      MaxRetries: 1
+      ExecutionProperty:
+        MaxConcurrentRuns: 3   # allow parallel runs for concurrent file uploads
+      DefaultArguments:
+        # OUTPUT_S3_PATH is static — always writes to TargetBucket/output/
+        # INPUT_S3_PATH is dynamic — Lambda overrides it per run with the
+        # exact uploaded file path.
+        --job-language: python
+        --job-bookmark-option: job-bookmark-disable
+        --OUTPUT_S3_PATH: !Sub s3://${TargetBucket}/${OutputPrefix}
+        --enable-metrics: "true"
+        --enable-continuous-cloudwatch-log: "true"
+        --enable-spark-ui: "true"
+        --spark-event-logs-path: !Sub s3://${TargetBucket}/spark-logs/
+
+  # ── Lambda IAM Role ─────────────────────────────────────────────────────────
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-lambda-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: StartGlueJob
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                Resource:
+                  - !Sub arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:job/${GlueJob}
+
+  # ── Lambda Function ─────────────────────────────────────────────────────────
+
+  TriggerGlueLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-trigger-glue
+      Description: >
+        Receives S3 Object Created events from EventBridge, extracts the
+        uploaded file's S3 path, and starts the Glue job with that path
+        passed as --INPUT_S3_PATH.
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Timeout: 60
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          JOB_NAME: !Ref GlueJob
+          INPUT_PREFIX: !Ref InputPrefix
+      Code:
+        ZipFile: |
+          import os
+          import boto3
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          glue = boto3.client("glue")
+
+          JOB_NAME    = os.environ["JOB_NAME"]
+          INPUT_PREFIX = os.environ["INPUT_PREFIX"]
+
+          def lambda_handler(event, context):
+              """
+              EventBridge delivers S3 object-created events in the shape:
+                {
+                  "detail": {
+                    "bucket": {"name": "..."},
+                    "object": {"key": "input/data.tsv"}
+                  }
+                }
+
+              We extract the exact S3 path, skip anything that isn't under
+              the monitored input prefix (e.g. the Glue script itself), then
+              start the Glue job with --INPUT_S3_PATH pointing at the file.
+              """
+              detail      = event.get("detail", {})
+              bucket_name = detail.get("bucket", {}).get("name", "")
+              object_key  = detail.get("object", {}).get("key", "")
+
+              logger.info("S3 event — bucket: %s  key: %s", bucket_name, object_key)
+
+              # Only process files uploaded under the watched prefix
+              if not object_key.startswith(INPUT_PREFIX):
+                  logger.info(
+                      "Key '%s' is outside the input prefix '%s' — skipping.",
+                      object_key, INPUT_PREFIX,
+                  )
+                  return {"status": "skipped", "key": object_key}
+
+              # Skip the Glue script itself if it happens to be in the same bucket
+              if object_key.endswith(".py"):
+                  logger.info("Skipping Python script upload: %s", object_key)
+                  return {"status": "skipped", "key": object_key}
+
+              input_s3_path = f"s3://{bucket_name}/{object_key}"
+              logger.info("Starting Glue job '%s' with INPUT_S3_PATH=%s", JOB_NAME, input_s3_path)
+
+              response = glue.start_job_run(
+                  JobName=JOB_NAME,
+                  Arguments={
+                      # Override the default INPUT_S3_PATH with the exact
+                      # file that was just uploaded
+                      "--INPUT_S3_PATH": input_s3_path,
+                  },
+              )
+
+              run_id = response.get("JobRunId", "unknown")
+              logger.info("Glue job started — RunId: %s", run_id)
+              return {
+                  "status":  "started",
+                  "runId":   run_id,
+                  "jobName": JOB_NAME,
+                  "input":   input_s3_path,
+              }
+
+  # ── EventBridge Rule ────────────────────────────────────────────────────────
+
+  EventBridgeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${AWS::StackName}-s3-object-created
+      Description: Fires when any object is created in SourceBucket
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - Object Created
+        detail:
+          bucket:
+            name:
+              - !Ref SourceBucket
+          # Scope the rule to the input prefix so Glue-script uploads
+          # that land elsewhere don't trigger unnecessary runs.
+          # Lambda does a second prefix check as a safety net.
+          object:
+            key:
+              - prefix: !Ref InputPrefix
+      Targets:
+        - Arn: !GetAtt TriggerGlueLambda.Arn
+          Id: TriggerGlueLambda
+
+  # ── Lambda invocation permission for EventBridge ────────────────────────────
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref TriggerGlueLambda
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt EventBridgeRule.Arn
+
+# ── Outputs ──────────────────────────────────────────────────────────────────
+Outputs:
+
+  SourceBucketName:
+    Description: Upload TSV files here under input/ to trigger the pipeline
+    Value: !Ref SourceBucket
+
+  TargetBucketName:
+    Description: Output .tab reports are written here under output/
+    Value: !Ref TargetBucket
+
+  GlueJobName:
+    Description: Name of the Glue ETL job
+    Value: !Ref GlueJob
+
+  LambdaFunctionName:
+    Description: Name of the Lambda trigger function
+    Value: !Ref TriggerGlueLambda
+
+  GlueScriptUploadCommand:
+    Description: >
+      Run this AWS CLI command to upload the Glue script before triggering
+      a pipeline run. Replace <local-path> with the path to your script.
+    Value: !Sub >
+      aws s3 cp <local-path>/glue_search_keyword_performance.py
+      s3://${ScriptBucket}/${GlueScriptKey}
