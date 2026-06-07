@@ -1,0 +1,298 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Adobe ACS — Search Keyword Performance Pipeline (Lambda Edition)
+  S3 (TSV upload) → EventBridge → Lambda (process + write) → S3 (output .tab)
+
+  No Glue. Lambda streams the TSV from SourceBucket, runs the search-keyword
+  attribution pipeline in-process, and writes a single .tab file to TargetBucket.
+
+Parameters:
+  InputPrefix:
+    Type: String
+    Default: input/
+    Description: >
+      S3 key prefix Lambda watches. Only objects uploaded under this prefix
+      trigger processing. Upload your TSV files here.
+
+  OutputPrefix:
+    Type: String
+    Default: output/
+    Description: S3 key prefix in TargetBucket where .tab results are written.
+
+  LambdaMemoryMB:
+    Type: Number
+    Default: 512
+    AllowedValues: [256, 512, 1024, 2048, 3008, 10240]
+    Description: >
+      Lambda memory in MB. Controls both RAM and vCPU allocation.
+      512 MB handles files up to ~200 MB comfortably.
+      For files up to 1 GB use 2048 MB.
+      For files beyond 1 GB consider the Glue version.
+
+  LambdaTimeoutSeconds:
+    Type: Number
+    Default: 300
+    MinValue: 30
+    MaxValue: 900
+    Description: >
+      Lambda timeout in seconds (max 900 = 15 min).
+      Increase for larger input files.
+
+Resources:
+
+  # ── S3 Buckets ─────────────────────────────────────────────────────────────
+
+  SourceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+
+  TargetBucket:
+    Type: AWS::S3::Bucket
+
+  # ── IAM Role for Lambda ─────────────────────────────────────────────────────
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-lambda-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # CloudWatch Logs — Lambda writes execution logs here automatically
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LambdaS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Read the uploaded TSV from SourceBucket
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt SourceBucket.Arn
+                  - !Sub ${SourceBucket.Arn}/*
+              # Write the .tab report to TargetBucket
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource:
+                  - !Sub ${TargetBucket.Arn}/*
+
+  # ── Lambda Function ─────────────────────────────────────────────────────────
+
+  SearchKeywordLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-search-keyword-performance
+      Description: >
+        Streams an Adobe Analytics TSV from S3, applies last-touch search
+        attribution, and writes a revenue-sorted .tab report to S3.
+      Runtime: python3.12
+      Handler: lambda_search_keyword_performance.lambda_handler
+      MemorySize: !Ref LambdaMemoryMB
+      Timeout: !Ref LambdaTimeoutSeconds
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          TARGET_BUCKET:  !Ref TargetBucket
+          OUTPUT_PREFIX:  !Ref OutputPrefix
+          INPUT_PREFIX:   !Ref InputPrefix
+      # Code is uploaded as a .zip via S3 or AWS Console after stack creation.
+      # The ZipFile inline approach below is used for the initial deploy only —
+      # replace with S3-backed Code block once you upload the real zip.
+      Code:
+        ZipFile: |
+          import os, io, csv, logging, boto3
+          from datetime import date
+          from urllib.parse import urlparse, parse_qs
+          from collections import defaultdict
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          s3 = boto3.client("s3")
+
+          SEARCH_ENGINES = {"google.com","bing.com","yahoo.com","msn.com","search.msn.com"}
+          KEYWORD_PARAMS = {
+              "google.com":["q"],"bing.com":["q"],"yahoo.com":["p","q"],
+              "msn.com":["q"],"search.msn.com":["q"],
+          }
+          PURCHASE_EVENT = "1"
+          TARGET_BUCKET  = os.environ.get("TARGET_BUCKET","")
+          OUTPUT_PREFIX  = os.environ.get("OUTPUT_PREFIX","output").strip("/")
+          INPUT_PREFIX   = os.environ.get("INPUT_PREFIX","input/")
+
+          class HitRecord:
+              __slots__ = ("ip","event_list","product_list","referrer")
+              def __init__(self, row):
+                  self.ip           = row.get("ip","").strip()
+                  self.event_list   = row.get("event_list","").strip()
+                  self.product_list = row.get("product_list","").strip()
+                  self.referrer     = row.get("referrer","").strip()
+              def is_purchase(self):
+                  return PURCHASE_EVENT in [e.strip() for e in self.event_list.split(",") if e.strip()]
+              def total_revenue(self):
+                  if not self.is_purchase() or not self.product_list:
+                      return 0.0
+                  total = 0.0
+                  for product in self.product_list.split(","):
+                      parts = product.split(";")
+                      if len(parts) >= 4:
+                          try: total += float(parts[3].strip())
+                          except ValueError: pass
+                  return total
+
+          class ReferrerParser:
+              @staticmethod
+              def _root_domain(h):
+                  h = h.lower()
+                  if h.startswith("www."): h = h[4:]
+                  p = h.split(".")
+                  return ".".join(p[-2:]) if len(p) >= 2 else h
+              @classmethod
+              def parse(cls, referrer):
+                  if not referrer: return None, None
+                  try:
+                      parsed = urlparse(referrer.strip())
+                      root   = cls._root_domain(parsed.netloc.lower())
+                      if root not in SEARCH_ENGINES: return None, None
+                      qs = parse_qs(parsed.query)
+                      for key in KEYWORD_PARAMS.get(root, ["q"]):
+                          if key in qs and qs[key]: return root, qs[key][0].strip()
+                      return None, None
+                  except Exception: return None, None
+
+          class SearchKeywordProcessor:
+              def __init__(self, source_bucket, source_key, target_bucket, output_prefix):
+                  self.source_bucket = source_bucket
+                  self.source_key    = source_key
+                  self.target_bucket = target_bucket
+                  self.output_prefix = output_prefix.strip("/")
+                  self._revenue      = defaultdict(float)
+              def run(self):
+                  logger.info("Processing s3://%s/%s", self.source_bucket, self.source_key)
+                  self._process_file()
+                  return self._write_output()
+              def _process_file(self):
+                  response     = s3.get_object(Bucket=self.source_bucket, Key=self.source_key)
+                  text_stream  = io.TextIOWrapper(response["Body"], encoding="utf-8", newline="")
+                  parser       = ReferrerParser()
+                  ip_attr      = {}
+                  for raw_row in csv.DictReader(text_stream, delimiter="\t"):
+                      row  = {k.strip(): v for k, v in raw_row.items()}
+                      hit  = HitRecord(row)
+                      d, kw = parser.parse(hit.referrer)
+                      if d and kw: ip_attr[hit.ip] = (d, kw)
+                      if hit.is_purchase():
+                          rev  = hit.total_revenue()
+                          attr = ip_attr.get(hit.ip)
+                          if attr and rev > 0: self._revenue[attr] += rev
+              def _write_output(self):
+                  today  = date.today().strftime("%Y-%m-%d")
+                  key    = f"{self.output_prefix}/{today}_SearchKeywordPerformance.tab"
+                  buf    = io.StringIO()
+                  writer = csv.writer(buf, delimiter="\t", lineterminator="\r\n")
+                  writer.writerow(["Search Engine Domain","Search Keyword","Revenue"])
+                  for (d, kw), rev in sorted(self._revenue.items(), key=lambda x: x[1], reverse=True):
+                      writer.writerow([d, kw, f"{rev:.2f}"])
+                  s3.put_object(Bucket=self.target_bucket, Key=key,
+                                Body=buf.getvalue().encode("utf-8"),
+                                ContentType="text/tab-separated-values")
+                  return f"s3://{self.target_bucket}/{key}"
+
+          def lambda_handler(event, context):
+              detail      = event.get("detail", {})
+              bucket_name = detail.get("bucket", {}).get("name", "")
+              object_key  = detail.get("object", {}).get("key", "")
+              logger.info("Event — bucket: %s  key: %s", bucket_name, object_key)
+              if not object_key.startswith(INPUT_PREFIX):
+                  return {"status": "skipped", "reason": "outside input prefix"}
+              if object_key.endswith(".py"):
+                  return {"status": "skipped", "reason": "python script"}
+              if not TARGET_BUCKET:
+                  raise ValueError("TARGET_BUCKET env var not set")
+              output_uri = SearchKeywordProcessor(
+                  bucket_name, object_key, TARGET_BUCKET, OUTPUT_PREFIX
+              ).run()
+              logger.info("Output: %s", output_uri)
+              return {"status":"success","input":f"s3://{bucket_name}/{object_key}","output":output_uri}
+
+  # ── EventBridge Rule ────────────────────────────────────────────────────────
+
+  EventBridgeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${AWS::StackName}-s3-object-created
+      Description: Fires when a file is uploaded to SourceBucket under input/
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - Object Created
+        detail:
+          bucket:
+            name:
+              - !Ref SourceBucket
+          object:
+            key:
+              - prefix: !Ref InputPrefix
+      Targets:
+        - Arn: !GetAtt SearchKeywordLambda.Arn
+          Id: SearchKeywordLambda
+
+  # ── Lambda invoke permission for EventBridge ────────────────────────────────
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref SearchKeywordLambda
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt EventBridgeRule.Arn
+
+# ── Outputs ──────────────────────────────────────────────────────────────────
+Outputs:
+
+  SourceBucketName:
+    Description: >
+      Upload TSV files here under input/ to trigger the pipeline.
+      e.g. aws s3 cp data.tsv s3://<bucket>/input/data.tsv
+    Value: !Ref SourceBucket
+
+  TargetBucketName:
+    Description: Output .tab reports are written here under output/
+    Value: !Ref TargetBucket
+
+  LambdaFunctionName:
+    Description: Name of the Lambda processing function
+    Value: !Ref SearchKeywordLambda
+
+  LambdaFunctionArn:
+    Description: ARN of the Lambda function (use to deploy updated code)
+    Value: !GetAtt SearchKeywordLambda.Arn
+
+  DeployCodeCommand:
+    Description: >
+      After stack creation, deploy the full lambda_search_keyword_performance.py
+      using this command (zip it first).
+    Value: !Sub >
+      zip function.zip lambda_search_keyword_performance.py &&
+      aws lambda update-function-code
+      --function-name ${SearchKeywordLambda}
+      --zip-file fileb://function.zip
+      --region ${AWS::Region}
+
+  UploadTestFileCommand:
+    Description: Upload a test TSV to trigger the pipeline
+    Value: !Sub >
+      aws s3 cp data.tsv s3://${SourceBucket}/input/data.tsv
